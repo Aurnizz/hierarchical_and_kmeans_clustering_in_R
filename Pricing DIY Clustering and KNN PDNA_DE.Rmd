@@ -1,0 +1,856 @@
+---
+title: "Pricing DIY Clustering PDNA"
+author: "Omar ElMaria"
+date: "11/3/2020"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# Step 1: Download the libraries and select your pilot class
+
+```{r download_libraries, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(plotly)
+library(dplyr)
+library(flexdashboard)
+library(RODBC)
+library(ggplot2)
+library(tidyverse)
+library(lubridate)
+library(dendextend)
+library(factoextra)
+library(psych)
+library(gridExtra)
+library(reshape2)
+library(stringr)
+library(RJDBC)
+library(writexl)
+
+clid <- 443 # Either choose 443 for Sofa & Console Tables or 6289 for nightstands
+schema_attribute <- "BaseMaterial" # Choose the schema tag attribute that you want the material query to look for
+```
+
+# Step 2.1: Extract the relevant OcIDs from the snapshot
+
+```{r snapshot_data_extraction, echo=TRUE}
+
+df_ss_query <- paste0("SELECT * FROM
+csn_junk..tblDailySnapshot_DE
+WHERE clid IN (", clid,")")
+
+# Execute query
+dbHandle <- odbcDriverConnect('driver=SQL Server;server=BOSQLINT02;trusted_connection=true')
+df_ss <- sqlQuery(dbHandle, df_ss_query, stringsAsFactors = FALSE)
+odbcClose(dbHandle)
+
+# Return results
+head(df_ss, 10)
+
+df_ss_query_2 <- paste0("SELECT * FROM
+csn_junk..tblDailySnapshot_UK
+WHERE clid IN (", clid,")")
+
+# Execute query
+dbHandle <- odbcDriverConnect('driver=SQL Server;server=BOSQLINT02;trusted_connection=true')
+df_ss_UK_forPDNA <- sqlQuery(dbHandle, df_ss_query_2, stringsAsFactors = FALSE)
+odbcClose(dbHandle)
+
+# Return results
+head(df_ss_UK_forPDNA, 10)
+
+```
+
+# Step 2.2: Extract UK PDNA data from Hive and join it to the DE snapshot data
+
+
+```{r pdna_data_extraction, echo=TRUE}
+
+# Extract the PDNA data from hive
+
+# You need to change the path in list.files to where the .jar files are stored (V. important)
+
+hive.query <- function(q){
+  HiveDriver = RJDBC::JDBC(driverClass="org.apache.hive.jdbc.HiveDriver", 
+                           list.files("C:\\Users\\oe486e\\Desktop\\Wayfair_Work\\JDBC Drivers", pattern="jar$", full.names=T)) # Replace the path here
+  Hive = RJDBC::dbConnect(HiveDriver, "jdbc:hive2://hadoop-das-hive.service.bo1.csnzoo.com:10000/default")
+  return(RJDBC::dbGetQuery(Hive, q))
+}
+
+# Define the query that runs in DBeaver (please make sure to change the model version if better PDNA versions get rolled out - Version 3 refers to PDNA V2)
+pdna_func <- function(clid){
+    q <- paste0("SELECT *
+    FROM productdna_embeddings pdna
+    WHERE 1 = 1
+        AND model_version = 3  -- model_version of interest
+        AND pdna.date_updated IN (
+            SELECT MAX(date_updated) FROM productdna_embeddings
+            WHERE 1=1
+            AND model_version = 3  -- model_version of interest
+        )
+        AND pdna.clgid = 2 -- Catalog of interest
+        AND pdna.clid IN (", paste(clid, collapse = ","),") -- Class of interest
+    ORDER BY pdna.clid, pdna.prsku, pdna.optioncombinationid")
+    
+    return(q)
+} # The last command in the where clause filters for the defined class above 
+
+# df_pdna <- readxl::read_xlsx("PDNA_Generics_Classes.xlsx") # This part is only needed during testing - Comment out during actual implementation
+
+df_pdna <- hive.query(pdna_func(clid)) # Execute the hive query with the clid(s) chosen above (This command takes a some time to run)
+
+# rJava::.jclassLoader()$setDebug(1L) # A code for debugging the function that calls the JDBC driver if it malfunctions (only uncomment if the two code blocks above are not running)
+
+# Change the column names of the PDNA table
+colnames(df_pdna) <- c("prsku", "optioncombinationid", "ireid", "clid", "embedding", "date_added", "date_updated", "model_version", "clgid")
+
+df_ss_pdna <- df_ss %>% 
+  select(prsku, optioncombinationID, optionname, wholesalecost, Revenue90D, Revenue12M, 
+         SoldItems90D, CurrentPrice, DelphiHandler, suname, suid, clname, clid, mkcname, mkcid) %>% 
+  inner_join(df_pdna %>% select(prsku, optioncombinationid, clid, ireid, embedding), by = c("optioncombinationID" = "optioncombinationid", "prsku" = "prsku", "clid" = "clid")) %>% 
+  filter(!is.na(embedding)) # Join the DE snapshot to the UK PDNAs and filter out the empty embeddings
+
+```
+
+
+# Step 3: WSC visualization
+
+```{r WSC_visualization_and_binning, echo=TRUE}
+WSC_viz_func <- function (class_id){
+  
+  df_ss_pdna <- df_ss_pdna %>% filter(clid == class_id) # Create a temp df that stores the data relevant to the chosen class in the function's arguments
+  
+  WSC_stats <- psych::describe(df_ss_pdna$wholesalecost) # Summary statistics of the WSC
+  
+  WSC_overall_dist <- ggplot(data = df_ss_pdna, aes(x = wholesalecost)) + 
+    geom_histogram(breaks = seq(min(df_ss_pdna$wholesalecost), max(df_ss_pdna$wholesalecost), by = 50)) + 
+    scale_x_continuous(breaks = seq(min(df_ss_pdna$wholesalecost), max(df_ss_pdna$wholesalecost), by = 100), labels = scales::comma) +
+    theme(axis.text.x = element_text(angle = 90)) # Overall WSC distribution for the clid that you choose when you call the function above
+  
+  WSC_quantiles <- table(cut(df_ss_pdna$wholesalecost, breaks=c(quantile(df_ss_pdna$wholesalecost, probs = seq(0, 1, by = 0.3333))))) # Define the WSC's 3 subsets
+
+  result_WSC_viz_func <- list(WSC_stats, WSC_overall_dist, WSC_quantiles) # Store the 3 computed structures in a list
+  
+  return(result_WSC_viz_func) # Return the list
+}
+
+WSC_viz_func(clid)[[1]] # WSC stats of the chosen class
+
+WSC_viz_func(clid)[[2]] # Overall WSC distribution of the chosen class
+
+WSC_viz_func(clid)[[3]] # WSC quantiles of the chosen class and the number of OcIDs in each quantile
+
+```
+
+# Step 4: Hierarchical Clustering
+
+We do the hierarchical clustering first to find the suggested number of clusters/markets and cluster centroids which will both be used as inputs to the K-means algorithm. We apply the technique on the filtered SKUs from the previous step
+
+The procedure to perform hierarchical clustering is as follows:
+
+1) Split the PDNA vector into its elements (32 different variables)
+
+2) Standardize the data (i.e. calculate Z-scores) to preserve comparability of the results and ensure that variables with a large (original) standard deviation do not have an undue influence on the outcome. This is helpful when you have variables with different scales in the dataset
+
+3) Compute the distance matrix using the Euclidean distance as our measure of dissimilarity. The more dissimilar the objects are, the larger the computed distance
+
+4) Choose a clustering method. The method that we are going to go with is the Ward method because it minimizes the within-cluster variation
+
+5) Determine the number of clusters by examining the scree plot and dendrogram (tree diagram)
+
+```{r hierarchical_clustering, echo=TRUE}
+
+# Define a function that performs hierarchical clustering on the 3 WSC bins for a chosen class
+
+hclust_func <- function (class_id){
+  
+  # Step 1: Filter the original pdna table for data corresponding to one class
+  
+  df_ss_pdna <- df_ss_pdna %>% filter(clid == class_id)
+  
+  # Step 2: Create a list to store the PDNA data corrsponding to the 3 WSC bins
+  
+  WSC_bins <- list()
+
+  WSC_bins[[1]] <- df_ss_pdna[df_ss_pdna$wholesalecost >= quantile(df_ss_pdna$wholesalecost, 0) & df_ss_pdna$wholesalecost <= quantile(df_ss_pdna$wholesalecost, 0.3333), ]
+  
+  WSC_bins[[2]] <- df_ss_pdna[df_ss_pdna$wholesalecost > quantile(df_ss_pdna$wholesalecost, 0.3333) & df_ss_pdna$wholesalecost <= quantile(df_ss_pdna$wholesalecost, 0.6666), ]
+  
+  WSC_bins[[3]] <- df_ss_pdna[df_ss_pdna$wholesalecost > quantile(df_ss_pdna$wholesalecost, 0.6666) & df_ss_pdna$wholesalecost <= quantile(df_ss_pdna$wholesalecost, 1), ]
+  
+  
+  dist_mat <- list() # Defining an empty list for dist_mat to be used in step 4.4
+  hc.ward <- list() # Defining an empty list for the hierarchical clustering solution to be used in step 4.5
+  scree_plot <- list() # Defining an empty list for the scree plot to be used in step 4.5
+  hclust_assignments <- list() # Defining an empty list (a special data structure) for the hierarchical cluster assignments
+  hclust_sizes <- list() # Defining an empty list (a special data structure) for the hierarchical cluster sizes
+  
+  for (i in 1:length(WSC_bins)){
+    
+    WSC_bins[[i]] <- WSC_bins[[i]] %>%
+      select(-embedding) %>%
+      cbind(colsplit(WSC_bins[[i]]$embedding, ",", c("V1_PDNA", "V2_PDNA", "V3_PDNA", "V4_PDNA", "V5_PDNA", 
+                                                     "V6_PDNA", "V7_PDNA", "V8_PDNA", "V9_PDNA", "V10_PDNA", 
+                                                     "V11_PDNA", "V12_PDNA", "V13_PDNA", "V14_PDNA", "V15_PDNA", 
+                                                     "V16_PDNA", "V17_PDNA", "V18_PDNA", "V19_PDNA", "V20_PDNA", 
+                                                     "V21_PDNA", "V22_PDNA", "V23_PDNA", "V24_PDNA", "V25_PDNA", 
+                                                     "V26_PDNA", "V27_PDNA", "V28_PDNA", "V29_PDNA", "V30_PDNA", 
+                                                     "V31_PDNA", "V32_PDNA"))) # Split the PDNA vector of each WSC bin to 32 different variables
+    
+      
+    WSC_bins[[i]][, c("V1_PDNA")] <- sub(paste0("\\["), "", WSC_bins[[i]][, c("V1_PDNA")])
+    WSC_bins[[i]][, c("V32_PDNA")] <- sub(paste0("\\]"), "", WSC_bins[[i]][, c("V32_PDNA")])  # Remove the square bracket from V1_PDNA and V32_PDNA
+    
+    # Step 4.3: Change the split columns to numeric
+    WSC_bins[[i]][, grepl("_PDNA", colnames(WSC_bins[[i]]))] <- lapply(WSC_bins[[i]][, grepl("_PDNA", colnames(WSC_bins[[i]]))], FUN = as.numeric)
+    
+    # Step 4.4: Scale the data and compute the distance matrix
+    WSC_bins[[i]][, grepl("_PDNA", colnames(WSC_bins[[i]]))] <- scale(WSC_bins[[i]][, grepl("_PDNA", colnames(WSC_bins[[i]]))])
+    
+    # Step 4.5: Compute the distance matrix
+    dist_mat[[i]] <- dist(WSC_bins[[i]][, grepl("_PDNA", colnames(WSC_bins[[i]]))], method = "euclidean")
+    
+    # Step 4.5: Perform the hierarchical clustering and choose a linkage method
+    hc.ward[[i]] <- hclust(dist_mat[[i]], method = "ward.D2") # (Step 4.5)
+    
+    # Step 4.6: Determine the appropriate number of clusters by the scree plot
+    scree_plot[[i]] <- plot(rev(hc.ward[[i]]$height), # rev is used to plot from low to high values on Y axis
+                            type = "b",           # to display both the points and lines
+                            ylab = "Dissimilarity measure",
+                            xlab = "Number of clusters",
+                            main = "Scree plot",
+                            col = "darkblue",
+                            pch = 16,
+                            xlim = c(1,100)) +    # specify the plot symbol: 16 = filled circle
+      abline(v = 10, lty = 2, col = "darkred") + # draw a dark red vertical line at v = 10 
+      abline(v = 20, lty = 2, col = "purple") + # draw a purple vertical line at v = 20
+      abline(v = 30, lty = 2, col = "orange") + # draw an orange vertical line at v = 30
+      abline(v = 35, lty = 2, col = "darkgreen") + # draw a dark green vertical line at v = 35
+      abline(v = 40, lty = 2, col = "pink") # draw a dark green vertical line at v = 40           #(Step 4.6)
+    
+    # Step 4.7: Find the cluster assignments using the cutree function and the cluster sizes using the combination of table/cutree functions
+
+    ifelse(i == 1, j <- 1,
+           ifelse(i == 2, j <- 6,
+                  ifelse(i == 3, j <- 11,""))) # Defining a counter to store the 5 individual cluster solutions for each WSC bin
+    
+    
+    hclust_assignments[[j]] <- cutree(hc.ward[[i]], 10)
+    hclust_assignments[[j+1]] <- cutree(hc.ward[[i]], 20)
+    hclust_assignments[[j+2]] <- cutree(hc.ward[[i]], 30)
+    hclust_assignments[[j+3]] <- cutree(hc.ward[[i]], 35)
+    hclust_assignments[[j+4]] <- cutree(hc.ward[[i]], 40)
+    
+    hclust_sizes[[j]] <- table(cutree(hc.ward[[i]], 10))
+    hclust_sizes[[j+1]] <- table(cutree(hc.ward[[i]], 20))
+    hclust_sizes[[j+2]] <- table(cutree(hc.ward[[i]], 30))
+    hclust_sizes[[j+3]] <- table(cutree(hc.ward[[i]], 35))
+    hclust_sizes[[j+4]] <- table(cutree(hc.ward[[i]], 40))
+    
+  }
+  
+  return(list(WSC_bins, hclust_assignments, hclust_sizes, hc.ward))
+}
+
+hclust_sol <- hclust_func(clid) # Applying the function to output the hclust solution for the chosen class
+
+# Renaming the elements of the output list
+
+names(hclust_sol) <- c("Filtered Data Frame", "HClust Assignments", "HClust Sizes", "HClust Sol Structure")
+names(hclust_sol[["HClust Sol Structure"]]) <- c("HC_Sol_Struct_WSC_bin_1", "HC_Sol_Struct_WSC_bin_2", "HC_Sol_Struct_WSC_bin_3")
+names(hclust_sol[["Filtered Data Frame"]]) <- c("df_WSC_bin_1", "df_WSC_bin_2", "df_WSC_bin_3")
+
+Hclust_names <- c("WSC_bin_1_Cl10", "WSC_bin_1_Cl20", "WSC_bin_1_Cl30", "WSC_bin_1_Cl35", "WSC_bin_1_Cl40",
+                   "WSC_bin_2_Cl10", "WSC_bin_2_Cl20", "WSC_bin_2_Cl30", "WSC_bin_2_Cl35", "WSC_bin_2_Cl40",
+                   "WSC_bin_3_Cl10", "WSC_bin_3_Cl20", "WSC_bin_3_Cl30", "WSC_bin_3_Cl35", "WSC_bin_3_Cl40") # Define the element names of the list containing the cluster sizes 
+
+names(hclust_sol[["HClust Assignments"]]) <- Hclust_names
+names(hclust_sol[["HClust Sizes"]]) <- Hclust_names
+
+
+# Note: The produced scree plots are for the 3 WSC bins of the specified class
+```
+
+# Optional Step 5: Visulaizing the Dendrograms for the different WSC Bins
+
+```{r Dendogram_visualization, echo=TRUE}
+
+# Select the WSC bin that you want to examine by changing the counter below from 1 to 3
+
+plot(set(as.dendrogram(hclust_sol[["HClust Sol Structure"]][[1]]),  # (Step 4.7)
+         "branches_k_color", # to highlight the cluster solution with a color
+         k = 20), # Change this number depending on the number of clusters you want to create
+     ylab = "Distance",
+     main = "Dendrogram",
+     cex = 0.2)   # size of labels
+
+# rect.hclust(hclust_sol[["hc.ward_Linkage_Method"]][[1]], k = 10, border = "darkred")  # draw dark red borders around 10 clusters
+rect.hclust(hclust_sol[["HClust Sol Structure"]][[1]], k = 20, border = "darkblue")  # draw dark blue borders around 20 clusters
+# rect.hclust(hclust_sol[["hc.ward_Linkage_Method"]][[1]], k = 30, border = "darkorange")  # draw dark orange borders around 30 clusters
+# rect.hclust(hclust_sol[["hc.ward_Linkage_Method"]][[1]], k = 35, border = "darkgreen")  # draw dark green borders around 35 clusters
+# rect.hclust(hclust_sol[["hc.ward_Linkage_Method"]][[1]], k = 40, border = "darkpink")  # draw dark pink borders around 40 clusters
+
+```
+
+# Step 6: K-means partitioning
+
+We take the output of the hierarchical clustering and do a K-means partitioning analysis to divide the sample in a predetermined number of disjoint homogeneous groups. The objective function of K-means is to reduce the within-cluster variation as much as possible. A good K-means clustering is where between_SS/total_SS is high and the number of clusters is low because this means that the majority of the variation occurs **_between_** clusters and not **_within_** clusters without overfitting the data
+
+The steps needed to perform the K-means partitioning are as follows:
+
+1) Define the initial cluster centroids and number of clusters to be used as inputs to the K-means logic (taken as an input from the hierarchical clustering step)
+2) Run the K-means partitioning algorithm
+3) Display the results of the K-means partitioning approach
+
+**Note:** All cluster solutions from the previous step will be tried out and compared. This will be achieved by creating a function that executes the K-means logic and calling it for all cluster solutions that were obtained in the previous step
+
+```{r kmeans, echo=TRUE}
+
+# This is a function that performs the K-means partitioning logic given a specific number of clusters, hierarchical cluster solution, and original dataset containing the PDNA variables
+
+kmeans_func <- function(optimum_clust, df, hclust_assignments){
+  
+  df_subset <- df[, grepl("_PDNA", colnames(df))] # Create a subset out of the original dataset containing only the PDNA variables
+  
+  # Step 5.1: Compute the cluster centroids across the 32 PDNA variables to be used as an input for K-means
+  cent <- NULL
+
+  for(k in 1:optimum_clust){
+    cent <- rbind(cent, colMeans(df_subset[hclust_assignments == k, , drop = FALSE]))
+  }
+  
+  # Step 5.2: Run the K-means partitioning algorithm
+  set.seed(1)
+  
+  kmeans_algo <- kmeans(df_subset, centers = cent, iter.max = 100) # Change the max number of iterations to optimize for running time or keep at 100
+
+  # Step 5.3: Return the K-means resuls as a list
+  return(list(kmeans_algo))
+}
+
+# Step 4: Apply the function above on the 3 WSC bins iterating over all different cluster solutions
+
+output_kmeans <- list()
+
+# K means for the first WSC bin
+for (i in 1:5){
+  
+  ifelse(i == 1, j <- 10,
+         ifelse(i == 2, j <- 20,
+                ifelse(i == 3, j <- 30,
+                       ifelse(i == 4, j <- 35,
+                              j <- 40)))) 
+  
+  output_kmeans[i] <- kmeans_func(j, 
+                                    hclust_sol[["Filtered Data Frame"]][["df_WSC_bin_1"]], 
+                                    hclust_sol[["HClust Assignments"]][[i]])
+}
+
+# K means for the second WSC bin
+for (i in 6:10){
+  
+  ifelse(i == 6, j <- 10,
+         ifelse(i == 7, j <- 20,
+                ifelse(i == 8, j <- 30,
+                       ifelse(i == 9, j <- 35,
+                              j <- 40)))) 
+  
+  output_kmeans[i] <- kmeans_func(j, 
+                                    hclust_sol[["Filtered Data Frame"]][["df_WSC_bin_2"]], 
+                                    hclust_sol[["HClust Assignments"]][[i]])
+}
+
+# K means for the third WSC bin
+for (i in 11:15){
+  
+  ifelse(i == 11, j <- 10,
+         ifelse(i == 12, j <- 20,
+                ifelse(i == 13, j <- 30,
+                       ifelse(i == 14, j <- 35,
+                              j <- 40)))) 
+  
+  output_kmeans[i] <- kmeans_func(j, 
+                                    hclust_sol[["Filtered Data Frame"]][["df_WSC_bin_3"]], 
+                                    hclust_sol[["HClust Assignments"]][[i]])
+}
+
+
+kmeans_row_labels <- c("kmeans_WSC_bin_1_Cl10", "kmeans_WSC_bin_1_Cl20", "kmeans_WSC_bin_1_Cl30", "kmeans_WSC_bin_1_Cl35",
+                       "kmeans_WSC_bin_1_Cl40", "kmeans_WSC_bin_2_Cl10", "kmeans_WSC_bin_2_Cl20", "kmeans_WSC_bin_2_Cl30",
+                       "kmeans_WSC_bin_2_Cl35", "kmeans_WSC_bin_2_Cl40","kmeans_WSC_bin_3_Cl10", "kmeans_WSC_bin_3_Cl20", 
+                       "kmeans_WSC_bin_3_Cl30", "kmeans_WSC_bin_3_Cl35", "kmeans_WSC_bin_3_Cl40")
+
+names(output_kmeans) <- kmeans_row_labels
+```
+
+# Step 8: Comparing the results of the different K-means partitioning solutions
+
+From the K-means results, only the size, within-cluster_SS and between_SS/total_SS will be displayed
+
+```{r kmeans_results_comparison, echo=TRUE}
+
+# Combine the cluster sizes, within_ss, and between_SS / tot_SS of all K-means solutions of WSC bin 1 together in one dataframe
+
+kmeans_size <- NULL
+kmeans_within_ss <- NULL
+kmeans_clust_effectiveness <- NULL
+kmeans_clust_stats <- NULL
+
+for (i in 1:length(output_kmeans)){
+  kmeans_size <- rbind(kmeans_size, paste0("[", paste0(output_kmeans[[i]]$size, collapse = ", "), "]"))
+  
+  kmeans_within_ss <- rbind(kmeans_within_ss, paste0("[", paste0(round(output_kmeans[[i]]$withinss, 1), collapse = ", "), "]"))
+  
+  kmeans_clust_effectiveness <- rbind(kmeans_clust_effectiveness, output_kmeans[[i]]$betweenss / output_kmeans[[i]]$totss)
+  
+  kmeans_clust_stats <- rbind(kmeans_clust_stats, describe(output_kmeans[[i]]$size))
+}
+
+# Put the 3 vectors together in one table
+
+kmeans_comb_results <- as.data.frame(cbind(kmeans_size, kmeans_within_ss, round(kmeans_clust_effectiveness, 4)))
+
+# Rename the rows and columns
+
+rownames(kmeans_comb_results) <- kmeans_row_labels
+colnames(kmeans_comb_results) <- c("Cluster Sizes", "Within-cluster SS", "BetweenSS / TotSS")
+
+rownames(kmeans_clust_stats) <- kmeans_row_labels
+
+# Display the combined results and cluster stats
+
+kmeans_comb_results
+kmeans_clust_stats
+
+```
+
+# Step 9: Collecting Market KPIs
+
+Focus on the 20 cluster solutions in the 3 WSC bins because they seem the most promising. With 10 clusters, the betweenss/totss is too small. Cluster soltuions greater than 30 produce clusters with very few OcIDs. If we were to compare the 20-30 cluster solution, 20 is more favorable because it produces more OcIDs per cluster on average
+
+```{r market_KPI_collection, echo=TRUE}
+
+kmeans_comb_results <- kmeans_comb_results[grepl(c("Cl20"), row.names(kmeans_comb_results)), ]
+
+kmeans_clust_stats <- kmeans_clust_stats[grepl(c("Cl20"), row.names(kmeans_clust_stats)), ]
+
+kmeans_test <- output_kmeans[grepl("Cl20", names(output_kmeans))] # Filter for kmeans solutions that have 20 markets
+
+Market_KPIs <- list()
+
+for (i in 1:length(kmeans_test)){
+  hclust_sol[["Filtered Data Frame"]][[i]] <- cbind(hclust_sol[["Filtered Data Frame"]][[i]], 
+                                                              market = kmeans_test[[i]]$cluster)
+  
+  # Market KPIs
+  Market_KPIs[[i]] <- hclust_sol[["Filtered Data Frame"]][[i]] %>% 
+    group_by(market) %>% 
+    summarise(Num_OcID = n(), # No. of OcIDs in the market
+              Num_distinct_SKU = n_distinct(prsku), # No. of distinct SKUs in the market
+              Num_distinct_suppliers = n_distinct(suid), # No. of distinct suppliers in the market
+              FTR_eligible_ratio = sum(DelphiHandler == "ElastaPriceHandler")/n(), # FTR eligibility ratio
+              Qty90D = sum(SoldItems90D, na.rm = TRUE), # Items sold in the last 90 days
+              Rev90D = sum(Revenue90D, na.rm = TRUE), # GRS in the last 90 days
+              Retail_Price_Range = max(CurrentPrice) - min(CurrentPrice), # Retail price range
+              Retail_Price_variation = sd(CurrentPrice), # Retail price standard deviation
+              WSC_Range = max(wholesalecost) - min(wholesalecost), # WSC range
+              WSC_Variation = sd(wholesalecost)) # WSC standard deviation
+}
+
+names(Market_KPIs) <- c("Market_KPIs_WSC_bin_1", "Market_KPIs_WSC_bin_2", "Market_KPIs_WSC_bin_3")
+
+# Display the KPIs of markets in each WSC bin in a separate data frame
+
+KPIs_WSC_bin_1 <- Market_KPIs[[1]] %>%
+  mutate(WSC_bin = "1") %>% 
+  arrange(Num_distinct_suppliers)
+
+KPIs_WSC_bin_2 <- Market_KPIs[[2]] %>% 
+  mutate(WSC_bin = "2") %>% 
+  arrange(Num_distinct_suppliers)
+
+KPIs_WSC_bin_3 <- Market_KPIs[[3]] %>% 
+  mutate(WSC_bin = "3") %>% 
+  arrange(Num_distinct_suppliers)
+
+# Compute summary statistics of all markets per WSC bin 
+
+KPIs_all_bins <- rbind(KPIs_WSC_bin_1, KPIs_WSC_bin_2, KPIs_WSC_bin_3) 
+
+KPIs_combined <- describeBy(KPIs_all_bins[, c("Num_OcID", "Num_distinct_SKU", "Num_distinct_suppliers")], 
+                            group = KPIs_all_bins$WSC_bin, mat = TRUE)
+
+# rm(list=setdiff(ls(), "df_ss"))
+
+```
+
+
+# Step 10: Compute the NNs for the markets formed with WSC binning and clustering
+
+```{r Nearest neighbors for markets with WSC binning and clustering, echo=TRUE}
+
+incl_cols <- c("V1_PDNA","V2_PDNA","V3_PDNA","V4_PDNA","V5_PDNA","V6_PDNA","V7_PDNA","V8_PDNA","V9_PDNA","V10_PDNA","V11_PDNA","V12_PDNA","V13_PDNA","V14_PDNA","V15_PDNA","V16_PDNA","V17_PDNA","V18_PDNA","V19_PDNA","V20_PDNA","V21_PDNA","V22_PDNA","V23_PDNA","V24_PDNA","V25_PDNA","V26_PDNA","V27_PDNA","V28_PDNA","V29_PDNA","V30_PDNA","V31_PDNA","V32_PDNA") # Specifying the PDNA columns to compute the euclidena distance on
+
+# Define a function to compute the nearest neighbors for each OcID in a specified market and WSC bin
+
+NN_func <- function(WSC_bin_num, market_num){
+  
+  WSC_bin_NN <- hclust_sol[["Filtered Data Frame"]][[paste0("df_",WSC_bin_num)]] # Obtaining the original data set of WSC bin N
+  
+  WSC_bin_NN <- WSC_bin_NN %>%
+    select(-market) %>% 
+    cbind(kmeans_market = kmeans_test[[paste0("kmeans_", WSC_bin_num,"_Cl20")]]$cluster) # Appending the kmeans results of WSC bin N with a 20-market solution to the dataset
+  
+  WSC_bin_NN_subset <- subset(WSC_bin_NN, kmeans_market == market_num) # Subsetting the data set to include the OcIDs in market N only (you can choose any value from 1 to 20 when calling the function)
+  
+  WSC_bin_NN_subset <- WSC_bin_NN_subset[!duplicated(WSC_bin_NN_subset$optioncombinationID), ] # Removing duplicate OcIDs (MUST CHECK WHY THIS HAPPENS)
+  
+  row.names(WSC_bin_NN_subset) <- paste0(WSC_bin_NN_subset$prsku, "_", WSC_bin_NN_subset$optioncombinationID) # Changing the row labels of the subset to PrSKU | OcID
+  
+  dist_mat_NN <- as.matrix(dist(WSC_bin_NN_subset[, colnames(WSC_bin_NN_subset) %in% incl_cols], method = "euclidean")) # Use the euclidean distance as the similarity measure
+  
+  dist_melt <- melt(dist_mat_NN) # Melting the distance matrix to make it easier to form a sorted view of the nearest neighbor of each anchor OcID
+  
+  dist_mat_NN <- cbind(colsplit(dist_melt$Var1, "_", c("Neighbor_SKU", "Neighbor_OcID")), 
+                 colsplit(dist_melt$Var2, "_", c("Anchor_SKU", "Anchor_OcID")),
+                 Euclidean_dist = dist_melt$value) # Splitting the PrSKU | OcID vectors into distinct columns
+  
+  dist_mat_NN <- dist_mat_NN %>% 
+    group_by(Anchor_OcID) %>% 
+    arrange(Anchor_OcID, Euclidean_dist) %>% # Sorting based on NN
+    mutate(Neighbor_num = seq(1,nrow(WSC_bin_NN_subset),1)) %>% # Change the number in the middle according to the number of OcIDs in the market
+    left_join(WSC_bin_NN_subset %>% select(optioncombinationID, Revenue12M), by = c("Anchor_OcID" = "optioncombinationID")) %>% 
+    rename(Revenue12M_Anchor_OcID = Revenue12M) %>% 
+    left_join(WSC_bin_NN_subset %>% select(optioncombinationID, Revenue12M), by = c("Neighbor_OcID" = "optioncombinationID")) %>% 
+    rename(Revenue12M_Neighbor_OcID = Revenue12M) # Joining the Qty sold of the anchor and neighbor OcIDs
+  
+  return(dist_mat_NN)
+  
+}
+
+
+# Select certain markets following the NN with clustering approach
+
+NN_Markets <- list()
+
+# 4 markets in the first WSC bin of the selected class
+
+for (i in 1:4){
+  
+  ifelse(i == 1, j <- 6,
+         ifelse(i == 2, j <- 5,
+                ifelse(i == 3, j <- 3,
+                       ifelse(i == 4, j <- 10))))
+  
+  NN_Markets[[i]] <- NN_func("WSC_bin_1", j)
+  
+  NN_Markets[[i]] <- NN_Markets[[i]] %>% 
+  group_by(Anchor_OcID) %>%
+  mutate(Num_OcIDs_in_Market = n()) %>% 
+  distinct(Neighbor_SKU, .keep_all = TRUE) %>% # filter distinct SKUs only 
+    mutate(Distinct_SKUs_in_Market = n()) %>% # Display the number of distinct SKUs within each market
+    filter(Anchor_OcID == NN_Markets[[i]]$Anchor_OcID[1]) %>%  # Filter for the top Anchor OcID only
+    head(11) # Display the top 10 NNs
+}
+
+# 4 markets in the second WSC bin of the selected class
+
+for (i in 5:8){
+  
+  ifelse(i == 5, j <- 10,
+         ifelse(i == 6, j <- 5,
+                ifelse(i == 7, j <- 16,
+                       ifelse(i == 8, j <- 14))))
+  
+  NN_Markets[[i]] <- NN_func("WSC_bin_2", j)
+  
+  NN_Markets[[i]] <- NN_Markets[[i]] %>% 
+  group_by(Anchor_OcID) %>%
+  mutate(Num_OcIDs_in_Market = n()) %>% 
+  distinct(Neighbor_SKU, .keep_all = TRUE) %>% # filter distinct SKUs only 
+    mutate(Distinct_SKUs_in_Market = n()) %>% # Display the number of distinct SKUs within each market
+    filter(Anchor_OcID == NN_Markets[[i]]$Anchor_OcID[1]) %>%  # Filter for the top Anchor OcID only
+    head(11) # Display the top 10 NNs
+}
+
+# 5 markets in the third WSC bin of the selected class
+
+for (i in 9:13){
+  
+  ifelse(i == 9, j <- 3,
+         ifelse(i == 10, j <- 18,
+                ifelse(i == 11, j <- 15,
+                       ifelse(i == 12, j <- 14, j <- 8))))
+  
+  NN_Markets[[i]] <- NN_func("WSC_bin_3", j)
+  
+  NN_Markets[[i]] <- NN_Markets[[i]] %>% 
+  group_by(Anchor_OcID) %>%
+  mutate(Num_OcIDs_in_Market = n()) %>% # Display the number of distinct OcIDs within each market
+  distinct(Neighbor_SKU, .keep_all = TRUE) %>% # filter distinct SKUs only 
+    mutate(Distinct_SKUs_in_Market = n()) %>% # Display the number of distinct SKUs within each market
+    filter(Anchor_OcID == NN_Markets[[i]]$Anchor_OcID[1]) %>%  # Filter for the top Anchor OcID only
+    head(11)
+}
+
+names(NN_Markets) <- c("WSC_bin_1_M1", "WSC_bin_1_M2", "WSC_bin_1_M3", "WSC_bin_1_M4",
+                       "WSC_bin_2_M1", "WSC_bin_2_M2", "WSC_bin_2_M3", "WSC_bin_2_M4",
+                       "WSC_bin_3_M1", "WSC_bin_3_M2", "WSC_bin_3_M3", "WSC_bin_3_M4",
+                       "WSC_bin_3_M5")
+
+
+# Combining all created markets together in one data frame (With Clustering)
+NN_Markets_Combined_List <- NULL
+
+for(i in 1:length(NN_Markets)){
+  NN_Markets_Combined_List <- rbind(NN_Markets_Combined_List, NN_Markets[[i]])
+}
+
+NN_Markets_Combined_List <- NN_Markets_Combined_List %>% 
+  arrange(Anchor_OcID, Neighbor_num)
+
+```
+
+
+# Step 11: Compute the NNs for the markets formed with WSC binning ONLY
+
+```{r Nearest neighbors for markets with WSC binning and clustering, echo=TRUE}
+NN_NoKM_func <- function(WSC_bin_num){
+  # Apply the NN approach on one WSC bin without the initial K-means clustering technique
+  
+  WSC_bin_NN_NoKM <- hclust_sol[["Filtered Data Frame"]][[paste0("df_",WSC_bin_num)]] # Obtaining the original data set of WSC bin N
+  
+  WSC_bin_NN_NoKM <- WSC_bin_NN_NoKM[!duplicated(WSC_bin_NN_NoKM$optioncombinationID), ] # Removing duplicate OcIDs (MUST CHECK WHY THIS HAPPENS)
+  
+  row.names(WSC_bin_NN_NoKM) <- paste0(WSC_bin_NN_NoKM$prsku, "_", WSC_bin_NN_NoKM$optioncombinationID) # Changing the row labels of the dataset to PrSKU | OcID
+  
+  dist_mat_NN_NoKM <- as.matrix(dist(WSC_bin_NN_NoKM[, colnames(WSC_bin_NN_NoKM) %in% incl_cols], method = "euclidean")) # Use the euclidean distance as the similarity measure
+  
+  dist_melt_NoKM <- melt(dist_mat_NN_NoKM) # Melting the distance matrix to make it easier to form a sorted view of the nearest neighbor of each anchor OcID
+  
+  dist_mat_NN_NoKM <- cbind(colsplit(dist_melt_NoKM$Var1, "_", c("Neighbor_SKU", "Neighbor_OcID")), 
+                 colsplit(dist_melt_NoKM$Var2, "_", c("Anchor_SKU", "Anchor_OcID")),
+                 Euclidean_dist = dist_melt_NoKM$value) # Splitting the PrSKU | OcID vectors into distinct columns
+  
+  dist_mat_NN_NoKM <- dist_mat_NN_NoKM %>% 
+    group_by(Anchor_OcID) %>% 
+    arrange(Anchor_OcID, Euclidean_dist) %>% # Sorting based on NN
+    mutate(Neighbor_num = seq(1,nrow(WSC_bin_NN_NoKM),1)) %>% # Change this number according to the number of OcIDs in WSC bin 1
+    left_join(WSC_bin_NN_NoKM %>% select(optioncombinationID, Revenue12M), by = c("Anchor_OcID" = "optioncombinationID")) %>% 
+    rename(Revenue12M_Anchor_OcID = Revenue12M) %>% 
+    left_join(WSC_bin_NN_NoKM %>% select(optioncombinationID, Revenue12M), by = c("Neighbor_OcID" = "optioncombinationID")) %>% 
+    rename(Revenue12M_Neighbor_OcID = Revenue12M) # Joining the Qty sold of the anchor and neighbor OcIDs
+  
+  return(dist_mat_NN_NoKM)
+}  
+
+OcID_list <- NA
+
+for (i in 1:length(NN_Markets)){ # 1 : No. of markets following the "with clustering" approach
+  
+  OcID_list[i] <- NN_Markets[[i]]$Anchor_OcID[1]
+} # Collect all anchor OcIDs from the previously created markets and store them in an array
+
+# Form the markets in each WSC bin, filtering for the OcIDs in the markets generated by the first method (i.e. with clustering)
+NN_Markets_NoKM <- list()
+
+for (i in 1:length(hclust_sol[["Filtered Data Frame"]])){ # 1 : No. of WSC bins
+  NN_Markets_NoKM[[i]] <- NN_NoKM_func(paste0("WSC_bin_", i)) %>% 
+  filter(Anchor_OcID %in% OcID_list) %>%
+    group_by(Anchor_OcID) %>%
+    mutate(Num_OcIDs_in_Market = n(),
+           WSC_bin = i) %>% # Display the number of distinct OcIDs within the WSC bin
+    distinct(Neighbor_SKU, .keep_all = TRUE) %>% # filter distinct SKUs only 
+    mutate(Distinct_SKUs_in_Market = n()) %>% # Display the number of distinct SKUs within the WSC bin
+    top_n(n = 11, wt = desc(Neighbor_num)) # Show the top 10 NNs for each anchor OcID
+} 
+
+names(NN_Markets_NoKM) <- c("WSC_bin_1", "WSC_bin_2", "WSC_bin_3") # Rename the list components
+
+
+# Combining all created markets together in one data frame (WithOUT Clustering)
+NN_Markets_NoKM_Combined_List <- NULL
+
+for(i in 1:length(NN_Markets_NoKM)){
+  NN_Markets_NoKM_Combined_List <- rbind(NN_Markets_NoKM_Combined_List, NN_Markets_NoKM[[i]])
+}
+
+NN_Markets_NoKM_Combined_List <- NN_Markets_NoKM_Combined_List %>% 
+  arrange(Anchor_OcID, Neighbor_num)
+
+
+```
+
+
+# Step 12: Pulling the Image URLs
+
+```{r Connecting to Vertica and pulling the image URLs, echo=TRUE}
+
+vertica.query <- function(q){
+  vDriver = JDBC(driverClass="com.vertica.jdbc.Driver", classPath="T:\\Analytics\\Vertica\\vertica-jdbc-9.1.1-0.jar")
+  vertica = dbConnect(vDriver, "jdbc:vertica://vertica.csnzoo.com:5433/Wayfair", "oe486e", "Oo*0122139788")
+  return(dbGetQuery(vertica,q))
+}
+
+image_query_func <- function(OcID){
+    q <- paste0("with best_image as (
+    select optioncombinationid as ocid,
+    	ireid,
+    	row_number() over (partition by optioncombinationid order by isoptionspecific desc, pctpiidmatch desc, rank asc) row_num
+    	from csn_classification.tblOcIDIreIDMap
+    	where optioncombinationid IN (", paste(OcID, collapse = ","),"))
+    
+    select ocid,
+    	concat('http://common.csnimages.com/rawimages/',cast(imgraw.IraRelativePath as varchar)) as image_url
+    	from best_image b
+    		join csn_product.tblimageresource iredna
+    			on b.IreID=iredna.IreID
+    		join csn_product.tblimageraw iradna
+    			on iradna.iraid=iredna.ireiraid
+    		join csn_product.tblImageRaw imgraw
+    			on iradna.iraid=imgraw.iraid
+    where b.row_num=1
+    ORDER BY ocid;")
+    
+    return(q)
+}
+    
+
+Image_WithClust <- vertica.query(image_query_func(NN_Markets_Combined_List$Neighbor_OcID))
+Image_WithoutClust <- vertica.query(image_query_func(NN_Markets_NoKM_Combined_List$Neighbor_OcID))
+
+```
+
+# Step 13: Appending the image URLs to the datasets
+
+```{r Image URL appending, echo=TRUE}
+
+Final_df_WithClust <- NN_Markets_Combined_List %>% 
+  select(-c("Revenue12M_Anchor_OcID", "Revenue12M_Neighbor_OcID")) %>% 
+  left_join(df_ss %>% select(optioncombinationID, optionname, CurrentPrice, wholesalecost), by = c("Neighbor_OcID" = "optioncombinationID")) %>% 
+  left_join(Image_WithClust, by = c("Neighbor_OcID" = "ocid"))
+  
+Final_df_WithoutClust <- NN_Markets_NoKM_Combined_List %>% 
+  select(-c("Revenue12M_Anchor_OcID", "Revenue12M_Neighbor_OcID")) %>% 
+  left_join(df_ss %>% select(optioncombinationID, optionname, CurrentPrice, wholesalecost), by = c("Neighbor_OcID" = "optioncombinationID")) %>% 
+  left_join(Image_WithoutClust, by = c("Neighbor_OcID" = "ocid"))
+
+```
+
+
+# Step 14: Pulling the matierals
+
+```{r Material_pulling, echo=TRUE}
+
+# df_temp <- readxl::read_xlsx("PrSKU List With Clust.xlsx") # Get the SKUs for which you want to pull the material
+
+Final_df_join <- rbind(Final_df_WithClust %>% mutate(Clust_flag = "W/ Clust"), Final_df_WithoutClust %>% mutate(Clust_flag = "W/out Clust") %>% select(-WSC_bin))
+
+material_func <- function(SKU_list){
+  material_query <- paste0("DECLARE @BclgID INT = 3
+  SELECT
+      pxt.PxtPdxSchemaID AS [SchemaID]
+      ,UPPER(pxt.PxtPrSKU) AS [PrSKU]
+      ,gstag.StagID  
+      ,ISNULL(gstag.StagActive,0) AS [StagActive]
+      ,gstag.StagStprID  
+      ,gstag.StagSpecialTypeID  
+      ,gptag.PtagDateUpdated  
+      ,gstag.StagName  
+      ,CASE  
+          WHEN ISNULL(NULLIF(RTRIM(LTRIM(gptag.PtagValue)),''), gaev.Value) IS NOT NULL 
+              THEN ISNULL(NULLIF(RTRIM(LTRIM(gptag.PtagValue)),''), gaev.Value)
+          WHEN ISNULL(NULLIF(RTRIM(LTRIM(gptag.PtagValue)),''), gaev.Value) IS NULL
+              THEN CASE
+                  WHEN ISNULL(gptag.PtagIsNA,0) = 1 THEN '[N/A]'
+                  WHEN ISNULL(gptag.PtagIsUnavailable,0) = 1 THEN '[UNAVAILABLE]'
+                  WHEN gptag.PtagTiedOptionCategory IS NOT NULL THEN CONCAT('[TIED TO: ', 
+                      gptag.PtagTiedOptionCategory, ']') END
+          END AS [TagValue]
+      ,IIF(gpi.PiCategory IS NOT NULL, CONCAT(gpi.PiCategory, ': ', gpi.PiName), NULL) AS [OptionName]
+      ,ISNULL(gpi.PiID,0) AS [PiID]
+      ,gstag.StagStsID
+   --   ,gstev.StevID  
+      ,IIF(gaev.PtagID IS NOT NULL, ISNULL(gaev.IsCustom,0), NULL) AS [IsCustom]
+      ,gptag.PtagPtcsID
+      ,ISNULL(gptag.PtagIsNA,0) AS [PtagIsNA]
+      ,ISNULL(gptag.PtagIsUnavailable,0) AS [PtagIsUnavailable]
+      ,stv.StvName
+      ,gptag.PtagOccurrence
+  FROM csn_product.dbo.tblProdDescXMLData pxt WITH(NOLOCK)
+  JOIN csn_product_global.dbo.fnGblProduct(@BclgID) gpr ON gpr.PrSKU = pxt.PxtPrSKU
+  JOIN csn_product.dbo.tblProdDescXmlSchema pdx WITH(NOLOCK) ON pdx.PdxSchemaID = pxt.PxtPdxSchemaID  
+  JOIN csn_product_global.dbo.fnGblSchemaTag(@BclgID) gstag ON gstag.StagSchemaID = pdx.PdxSchemaID
+  JOIN csn_product.dbo.tblplSchemaTagValidation stv WITH(NOLOCK) ON stv.StvID = gstag.StagStvID
+  LEFT JOIN csn_product_global.dbo.fnGblProductTag(@BclgID) gptag ON gptag.PtagPrSKU = gpr.PrSKU 
+      AND gptag.PtagStagID = gstag.StagID
+  LEFT JOIN csn_product_global.dbo.fnGblProductTagAllEnumValues(@BclgID) gaev ON gaev.PtagID = gptag.PtagID 
+      AND NULLIF(RTRIM(LTRIM(gaev.Value)),'') IS NOT NULL
+  LEFT JOIN csn_product.dbo.tbljoinProductTagOption piptag WITH(NOLOCK) ON piptag.PtagID = gptag.PtagID
+  LEFT JOIN csn_product_global.dbo.fnGblProductOption(@BclgID) gpi ON gpi.PiID = piptag.PiID 
+      AND gpi.PiPrSKU = gpr.PrSKU 
+  where pxt.PxtPrSKU in (", paste(gsub("\\b", "'", unique(SKU_list), perl=T), collapse = ","), ") and ISNULL(gstag.StagActive,0) = 1 and isnull(gpi.piactive,1) = 1
+  and StagName like '%material%'
+  order by  gpi.PiID")
+  
+  # Execute query
+  dbHandle <- odbcDriverConnect('driver=SQL Server;server=SQLMERCHANDISING;trusted_connection=true')
+  df_material <- sqlQuery(dbHandle, material_query, stringsAsFactors = FALSE)
+  odbcClose(dbHandle)
+  
+  return(df_material)
+}
+
+df_material_chosen_class <- material_func(Final_df_join$Neighbor_SKU) %>%
+  filter(StagName == schema_attribute) %>% 
+  arrange(PrSKU, StagName) # Get the Upholstery material for each SKU
+
+# Concatenate multiple materials for the same SKU
+
+Duplicate_SKUs <- unique(df_material_chosen_class[duplicated(df_material_chosen_class$PrSKU), "PrSKU"]) # Get a list of duplicate SKUs
+df_material_subset <- df_material_chosen_class[df_material_chosen_class$PrSKU %in% Duplicate_SKUs, ] # Create a subset dataset containing the duplicate SKUs
+
+df_material_chosen_class <- df_material_chosen_class %>% 
+  filter(!(PrSKU %in% Duplicate_SKUs)) # Filter out the duplicate SKUs from the original dataset
+  
+Material_concat <- as.data.frame(matrix(c(NA, NA), nrow = 1, ncol = length(colnames(df_material_subset)))) # Create an empty data frame to store the concatenated materials
+colnames(Material_concat) <- colnames(df_material_subset)
+
+for (i in 1:length(Duplicate_SKUs)){
+  
+  Material_concat[i, "PrSKU"] <- Duplicate_SKUs[i]
+  Material_concat[i, "TagValue"] <- paste(unique(df_material_subset$TagValue[df_material_subset$PrSKU == Duplicate_SKUs[i]]), collapse = " / ")
+}
+
+# Append the newly formed Material_concat table to the original material dataset
+df_material_chosen_class <- rbind(df_material_chosen_class, Material_concat)
+# write_xlsx(df_material_chosen_class, "TopMaterial_SCTables.xlsx")
+
+
+# Joining the material to the formed markets
+Final_df_WithClust <- Final_df_WithClust %>% 
+  left_join(df_material_chosen_class %>% select(PrSKU, TagValue), by = c("Neighbor_SKU" = "PrSKU"))
+
+colnames(Final_df_WithClust)[which(colnames(Final_df_WithClust) == "TagValue")] <- schema_attribute # Change the name of the column to indicate which part of the SKU has a material attached to it
+
+Final_df_WithClust <- Final_df_WithClust[, c("Neighbor_SKU", "Neighbor_OcID", "Anchor_SKU", "Anchor_OcID", "Euclidean_dist", "Neighbor_num", "Num_OcIDs_in_Market",
+                                             "Distinct_SKUs_in_Market", "optionname", "CurrentPrice", "wholesalecost", schema_attribute, "image_url")]
+
+
+Final_df_WithoutClust <- Final_df_WithoutClust %>% 
+  left_join(df_material_chosen_class %>% select(PrSKU, TagValue), by = c("Neighbor_SKU" = "PrSKU"))
+
+colnames(Final_df_WithoutClust)[which(colnames(Final_df_WithoutClust) == "TagValue")] <- schema_attribute # Change the name of the column to indicate which part of the SKU has a material attached to it
+
+Final_df_WithoutClust <- Final_df_WithoutClust[, c("Neighbor_SKU", "Neighbor_OcID", "Anchor_SKU", "Anchor_OcID", "Euclidean_dist", "Neighbor_num", "Num_OcIDs_in_Market",
+                                                   "WSC_bin", "Distinct_SKUs_in_Market", "optionname", "CurrentPrice", "wholesalecost", schema_attribute, "image_url")]
+
+# Create the Excel sheets for the UIs
+# write_xlsx(Final_df_WithClust, "Final_df_WithClust.xlsx")
+# write_xlsx(Final_df_WithoutClust, "Final_df_WithoutClust.xlsx")
+```
